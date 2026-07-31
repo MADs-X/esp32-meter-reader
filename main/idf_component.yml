@@ -6,6 +6,8 @@ dependencies:
   sqlite3:
     git: https://github.com/nopnop2002/esp32-idf-sqlite3.git
     path: components/esp32-idf-sqlite3
+  esp_wireguard:
+    git: https://github.com/martin-ger/esp_wireguard_idf_5.5.x.git
   # # Put list of dependencies here
   # # For components maintained by Espressif:
   # component: "~1.0.0"
