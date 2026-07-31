@@ -3,92 +3,106 @@
 #include "meter_protocol.h"
 #include "esp_log.h"
 #include <string.h>
-#include <sqlite3.h>
 
 static const char *TAG = "METER_SCHED";
 
-#define SCHEDULER_PERIOD_MS 60000
-static uint16_t seq_counter = 1;   // uint8_t → uint16_t
+#define SCHEDULER_PERIOD_MS 300000
+static uint8_t seq_counter = 1;
 
-static void send_meter_read_request(const char *meterSerial, int baudRate, const struct sockaddr_in6 *dest) {
-    // MR_READ_REQUEST oluştur ve gönder
-    uint8_t packet[32];
-    int offset = 0;
-    packet[offset++] = MR_READ_REQUEST;
-    uint8_t flags = 0;
-    uint8_t serialLen = strlen(meterSerial);
-    flags |= (serialLen & 0x1F) << 2; // bit2-6
-    // bit0 lastSucceed, bit1 containsXor, bit7 longRead hep 0 (temel senaryo)
-    packet[offset++] = flags;
-    packet[offset++] = seq_counter++;
-    if (seq_counter > 255) seq_counter = 1;
-
-    for (int i = 0; i < serialLen; i++) packet[offset++] = meterSerial[i];
-
-    // Baud indicator (örnek 9600 -> 0x35)
-    uint8_t baud_ind;
-    switch (baudRate) {
-        case 300:  baud_ind = 0x30; break;
-        case 600:  baud_ind = 0x31; break;
-        case 1200: baud_ind = 0x32; break;
-        case 2400: baud_ind = 0x33; break;
-        case 4800: baud_ind = 0x34; break;
-        case 9600: baud_ind = 0x35; break;
-        case 19200: baud_ind = 0x36; break;
-        default:   baud_ind = 0x35;
+// ------------------------------------------------------------------
+// Orijinal Protokole Tam Uyumlu MR_READ_REQUEST Gönderme
+// ------------------------------------------------------------------
+static bool send_meter_read_request(meter_read_target_t *target) {
+    if (meter_sock < 0) {
+        ESP_LOGE(TAG, "Cannot send request: meter_sock is not open!");
+        return false;
     }
-    packet[offset++] = baud_ind;
 
-    sendto(meter_sock, packet, offset, 0, (struct sockaddr *)dest, sizeof(struct sockaddr_in6));
-    ESP_LOGI(TAG, "Sent MR_READ_REQUEST to %s", meterSerial);
+    uint8_t packet[64];
+    int offset = 0;
+
+    // 1. Opcode
+    packet[offset++] = MR_READ_REQUEST;
+
+    // 2. Flags Hesaplama
+    // Bit 0   : lastSucceed (Varsayılan 0)
+    // Bit 1   : containsXor
+    // Bit 2..6: meterSerialLen
+    // Bit 7   : isLongRead
+    uint8_t serialLen = strlen(target->meterSerial);
+    if (serialLen > 16) serialLen = 16;
+
+    uint8_t flags = 0;
+    flags |= (0 & 0x01);                             // lastSucceed
+    if (target->hasXorData) flags |= MR_FLAG_CONTAINS_XOR;
+    flags |= (serialLen & 0x1F) << 2;               // meterSerialLen
+    if (target->isLongRead) flags |= MR_FLAG_LONG_READ;
+
+    packet[offset++] = flags;
+
+    // 3. Sequence Number (1-255 döngüsel)
+    packet[offset++] = seq_counter++;
+    if (seq_counter == 0) seq_counter = 1;
+
+    // 4. Sayaç Seri Numarası (ASCII)
+    for (int i = 0; i < serialLen; i++) {
+        packet[offset++] = target->meterSerial[i];
+    }
+
+    // 5. Opsiyonel XOR ve Readout Length
+    if (target->hasXorData) {
+        packet[offset++] = target->xorVal;
+        packet[offset++] = (uint8_t)(target->lastReadoutLen >> 8);   // Big-Endian MSB
+        packet[offset++] = (uint8_t)(target->lastReadoutLen & 0xFF); // Big-Endian LSB
+    }
+
+    // 6. Baud Rate Indikatörü (ASCII '0'-'6')
+    packet[offset++] = convert_baud_to_byte(target->startBaudRate);
+
+    // Hedef adres portu ve ailesini garanti et (UDP Port 8008)
+    target->destAddr.sin6_family = AF_INET6;
+    target->destAddr.sin6_port = htons(8008);
+
+    // UDP Paketini Gönder
+    int sent = sendto(meter_sock, packet, offset, 0, 
+                      (struct sockaddr *)&target->destAddr, sizeof(struct sockaddr_in6));
+
+    if (sent < 0) {
+        ESP_LOGE(TAG, "sendto failed for meter %s (errno: %d)", target->meterSerial, errno);
+        return false;
+    } else {
+        ESP_LOGI(TAG, "Sent MR_READ_REQUEST to %s (Baud: %d, Seq: %d, Len: %d bytes)", 
+                 target->meterSerial, target->startBaudRate, seq_counter - 1, offset);
+        return true;
+    }
 }
 
+// ------------------------------------------------------------------
+// Periyodik Scheduler Task'ı
+// ------------------------------------------------------------------
 void meter_scheduler_task(void *pvParameters) {
     TickType_t last_wake = xTaskGetTickCount();
+    ESP_LOGI(TAG, "Meter Scheduler Task calisiyor (Periyot: %d ms)...", SCHEDULER_PERIOD_MS);
+
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(SCHEDULER_PERIOD_MS));
 
-        // SQLite'den nodeInfo ve meterInfo oku
-        sqlite3 *db = NULL;
-        sqlite3_open("/spiffs/meter_data.db", &db);
-        if (!db) {
-            ESP_LOGE(TAG, "Cannot open DB for scheduling");
-            continue;
-        }
+        meter_read_target_t target;
 
-        const char *sql = "SELECT nodeSerial, nodeIp FROM nodeInfo;";
-        sqlite3_stmt *stmt;
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-            sqlite3_close(db);
-            continue;
-        }
+        if (get_next_meter_to_read(&target)) {
+            ESP_LOGI(TAG, "Okunacak sayac bulundu: %s (Node: %s), İstek gonderiliyor...", 
+                     target.meterSerial, target.nodeSerial);
 
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            const unsigned char *nodeSerial = sqlite3_column_text(stmt, 0);
-            const void *ipBlob = sqlite3_column_blob(stmt, 1);
-            struct sockaddr_in6 dest;
-            memcpy(&dest.sin6_addr, ipBlob, 16);
-            dest.sin6_family = AF_INET6;
-            dest.sin6_port = htons(8008);
-
-            // Bu node'a ait okunacak bir meterSerial bul
-            char meterSerial[16];
-            int baud = 9600;
-            // Basitçe meterInfo'dan al (örnek)
-            char sql2[256];
-            snprintf(sql2, sizeof(sql2),
-                "SELECT meterSerial, startBaudRate FROM meterInfo WHERE nodeSerial='%s' AND meterLastAccess=TRUE LIMIT 1;",
-                nodeSerial);
-            sqlite3_stmt *stmt2;
-            if (sqlite3_prepare_v2(db, sql2, -1, &stmt2, NULL) == SQLITE_OK &&
-                sqlite3_step(stmt2) == SQLITE_ROW) {
-                strcpy(meterSerial, (const char*)sqlite3_column_text(stmt2, 0));
-                baud = sqlite3_column_int(stmt2, 1);
-                send_meter_read_request(meterSerial, baud, &dest);
+            if (send_meter_read_request(&target)) {
+                // İstek gönderildi, cevap bekleniyor. status=false, error_code=0 (henüz hata yok)
+                mark_meter_last_access(target.meterSerial, false, 0);
+            } else {
+                // Gönderim hatası, retry_count artırılacak
+                mark_meter_last_access(target.meterSerial, false, -1);
+                ESP_LOGE(TAG, "MR_READ_REQUEST gonderilemedi!");
             }
-            sqlite3_finalize(stmt2);
+        } else {
+            ESP_LOGW(TAG, "Okunacak bekleyen sayac bulunamadi!");
         }
-        sqlite3_finalize(stmt);
-        sqlite3_close(db);
     }
 }

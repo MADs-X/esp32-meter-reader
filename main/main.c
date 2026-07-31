@@ -1,42 +1,50 @@
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "esp_mac.h"
+#include "esp_event.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
-#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_spiffs.h"
 #include "esp_netif.h"
-#include "esp_event.h"
-#include "esp_mac.h"
-#include "esp_heap_caps.h"
-
-// LwIP Kütüphaneleri
+#include "esp_http_client.h"
+#include "esp_sntp.h"
+#include "lwip/opt.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
 #include "lwip/pbuf.h"
 #include "lwip/netif.h"
 #include "lwip/tcpip.h"
-#include "lwip/ip6.h"
 #include "lwip/ip_addr.h"
-#include "lwip/opt.h"
-#include "lwip/err.h"
+#include "lwip/ip6.h"
 #include "lwip/sockets.h"
-#include "lwip/sys.h"
-#include <lwip/netdb.h>
-//sqlite
-#include <stdio.h>
-#include "esp_spiffs.h"
+#include "lwip/netdb.h"
+#include "lwip/dns.h"
 #include "sqlite3.h"
-//
-// Yeni meter protokolü için
 #include "meter_protocol.h"
 #include "meter_db.h"
 #include "meter_scheduler.h"
-
+#include "wifi_manager.h"
+#include "wireguard_manager.h"
+#include "db_migration.h"
+#include "udp_handlers.h"
 static const char *TAG = "SLIP_GATEWAY";
 static volatile bool cc1312_prefix_synced = false;
-
 // --- Donanım ve Bellek Tanımlamaları ---
 #define CC1312_UART_NUM  UART_NUM_1
 #define CC1312_TX_PIN    43 
@@ -52,13 +60,14 @@ static volatile bool cc1312_prefix_synced = false;
 #define SLIP_ESC         0xDB
 #define SLIP_ESC_END     0xDC
 #define SLIP_ESC_ESC     0xDD
+extern sqlite3* get_db_handle(void);
 
 // --- Global Değişkenler ---
 static QueueHandle_t uart_queue;
 struct netif my_slip_netif; 
 static SemaphoreHandle_t slip_tx_mutex = NULL;
 static uint8_t slip_tx_buffer[SLIP_MTU * 2 + 2];
-
+QueueHandle_t sensor_queue = NULL;
 // ==========================================
 // 1. FAZ: UART DONANIM BAŞLATMA
 // ==========================================
@@ -138,7 +147,7 @@ err_t slip_netif_init_cb(struct netif *netif) {
     netif->output_ip6 = slip_output_ip6; 
     
 #if LWIP_IPV4
-    netif->output = dummy_output_ipv4; 
+    //netif->output = dummy_output_ipv4; 
 #endif
 
     netif->mtu = SLIP_MTU;
@@ -160,8 +169,14 @@ void init_slip_netif(void) {
     }
     
     LOCK_TCPIP_CORE(); 
-    netif_add(&my_slip_netif, NULL, slip_netif_init_cb, tcpip_input);
-    netif_set_default(&my_slip_netif);
+    // IPv4 adresleri (kullanılmayacak, ama prototip gereği doldurulmalı)
+    ip4_addr_t ipaddr, netmask, gw;
+    IP4_ADDR(&ipaddr, 0, 0, 0, 0);
+    IP4_ADDR(&netmask, 0, 0, 0, 0);
+    IP4_ADDR(&gw, 0, 0, 0, 0);
+
+    netif_add(&my_slip_netif, &ipaddr, &netmask, &gw, NULL, slip_netif_init_cb, tcpip_input);
+    //netif_set_default(&my_slip_netif);
     netif_set_up(&my_slip_netif);
     netif_set_link_up(&my_slip_netif);
     
@@ -371,7 +386,7 @@ void slip_rx_task(void *arg) {
     
     free(temp_rx_buf);
     vTaskDelete(NULL);
-}
+}/* silinecek bunlar
 //parser
 void parse_sensor_payload(const uint8_t *data, int len, 
                           const struct sockaddr_in6 *source_addr,
@@ -489,21 +504,50 @@ void udp_server_task(void *pvParameters)
         ESP_LOGE("UDP", "Soket kapatildi, yeniden aciliyor...");
         vTaskDelay(100 / portTICK_PERIOD_MS);
     }
+}*/
+static void test_vpn_http_request(void) {
+    esp_http_client_config_t config = {
+        .url = "http://10.8.0.251/", 
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 10000,
+    };
+
+    ESP_LOGI("HTTP_TEST", "ESP32 tünel üzerinden istek atıyor: %s", config.url);
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE("HTTP_TEST", "HTTP Client başlatılamadı.");
+        return;
+    }
+
+    esp_err_t err = esp_http_client_perform(client);
+
+    if (err == ESP_OK) {
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI("HTTP_TEST", ">>> BAŞARILI! Sunucu Yanıtı: %d <<<", status_code);
+    } else {
+        ESP_LOGE("HTTP_TEST", ">>> BAŞARISIZ! İstek gitmedi. Hata: %s <<<", esp_err_to_name(err));
+    }
+
+    esp_http_client_cleanup(client);
 }
 // ==========================================
 // 4. FAZ: ANA UYGULAMA (APP MAIN)
 // ==========================================
-#include "meter_db.h"          // init_database, sqlite_task, db_write_request_t
-#include "meter_protocol.h"    // udp_meter_task
-#include "meter_scheduler.h"   // meter_scheduler_task
 
-// ... diğer include'lar ...
-
-// Global kuyruk (SQLite task ile haberleşme için)
-QueueHandle_t sensor_queue;
 
 void app_main(void) {
     ESP_LOGI(TAG, "Endustriyel IoT Gateway Baslatiliyor...");
+
+    // =========================================================
+    // 0. NVS BAŞLATMA (Wi-Fi için Zorunlu Ön Koşul)
+    // =========================================================
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 
     // 1. Mutex önceden oluşturulmalı ki Netif Initialize olurken hata vermesin
     if (slip_tx_mutex == NULL) {
@@ -514,52 +558,111 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    // =========================================================
+    // 2.5 WI-FI VE ZAMAN (SNTP) SENKRONİZASYONU
+    // =========================================================
+    ESP_LOGI(TAG, "Wi-Fi baslatiliyor...");
+    
+
+    wifi_manager_start("mavialp", "highfi2468"); 
+
+    while (!wifi_manager_is_connected()) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    ESP_LOGI(TAG, "Wi-Fi baglantisi basarili, IP alindi.");
+
+    ESP_LOGI(TAG, "SNTP baslatiliyor, zaman senkronizasyonu bekleniyor...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+
+    int retry = 0;
+    const int retry_count = 15;
+    while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+        ESP_LOGI(TAG, "Zaman bekleniyor... (%d/%d)", retry, retry_count);
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    
+    time_t now = 0;
+    struct tm timeinfo = { 0 };
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    ESP_LOGI(TAG, "Sistem saati guncellendi: %s", asctime(&timeinfo));
+
+
     // 3. UART VE NETIF BAŞLATILMASI
     init_cc1312_uart();
     init_slip_netif();
-    
-    // RX Task'i pür dikkat dinlemeye başlıyor...
+
+    // RX Task'i dinlemeye başlıyor...
     xTaskCreatePinnedToCore(slip_rx_task, "slip_rx_task", 8192, NULL, 10, NULL, 1);
     vTaskDelay(pdMS_TO_TICKS(100)); // Task'in ayağa kalkması için ufak bir pay
 
-    // 4. CC1312 RESET İŞLEMLERİ 
+    // 4. CC1312 RESET İŞLEMLERİ
     gpio_reset_pin(CC1312_RESET_PIN);
     gpio_set_direction(CC1312_RESET_PIN, GPIO_MODE_OUTPUT);
     gpio_set_pull_mode(CC1312_RESET_PIN, GPIO_PULLUP_ONLY);
-    
+
     ESP_LOGI(TAG, "CC1312 Donanimsal olarak resetleniyor...");
     gpio_set_level(CC1312_RESET_PIN, 0); 
-    vTaskDelay(pdMS_TO_TICKS(100)); 
-    
+    vTaskDelay(pdMS_TO_TICKS(100));           
+
     ESP_LOGI(TAG, "CC1312 Uyandiriliyor...");
     gpio_set_level(CC1312_RESET_PIN, 1); 
 
-    // ========== YENİ EKLENEN BÖLÜM ==========
-    // 5. SPIFFS ve SQLite Başlatma
-    init_vfs();   
+    // =========================================================
+    // SADECE EKLENEN KISIM (METER READ & DB SYSTEM)
+    // =========================================================
+    // WireGuard'ı BAŞLAT (Saat güncel ve Wi-Fi bağlı olduğu için sorunsuz el sıkışır)
+    if (wireguard_manager_start() == ESP_OK) {
+        ESP_LOGI(TAG, "WireGuard is active and routed.");
+    } else {
+        ESP_LOGW(TAG, "WireGuard not started or failed.");
+    }
+    vTaskDelay(pdMS_TO_TICKS(15000)); 
+    test_vpn_http_request();
+
+    init_vfs();        
     init_database();
 
-    // 6. Kuyruk Oluşturma (SQLite Task ile haberleşme için)
+    /*migrations mevzusu için
+    sqlite3 *db_handle = get_db_handle();
+    if (db_handle) {
+        ESP_LOGI(TAG, "OTA DB Migration kontrolu basliyor...");
+        esp_err_t mig_err = ota_db_migration_run(db_handle);
+        if (mig_err != ESP_OK) {
+            ESP_LOGW(TAG, "Migration yapilamadi (Hata: %s). Cihaz mevcut veritabaniyla calismaya devam ediyor.", esp_err_to_name(mig_err));
+        }
+    }*/
+
+     // Test amaçlı ota
+    /*
+    ESP_ERROR_CHECK(ota_fsm_init());
+    
+   
+    ota_request_t req = {
+        .target = OTA_TARGET_ESP32,
+        .fw_url = "https://server.com/esp32.bin",
+        .expected_sha256 = "..."
+    };
+    ota_fsm_trigger_update(&req);
+    */
+    // B. Veritabanı Yazma Kuyruğu
     sensor_queue = xQueueCreate(20, sizeof(db_write_request_t));
 
-    // 7. SQLite Task'ını Başlat (Arka plan veritabanı yazıcısı)
+    // C. Arka Plan SQLite Kayıt Task'ı
     xTaskCreate(sqlite_task, "sqlite_task", 8192, NULL, 5, NULL);
 
-    // 8. UDP Dinleyicileri Başlat (Mevcut olanlar)
-    ESP_LOGI("APP", "UDP Dinleyiciler baslatiliyor...");
+    // D. Mevcut UDP Dinleyicileri (Sensör Portları)
+    ESP_LOGI(TAG, "UDP Dinleyiciler baslatiliyor...");
+    init_udp_handlers();
 
-    xTaskCreate(udp_server_task, "udp_8004", 4096, (void*)8004, 5, NULL);
-    xTaskCreate(udp_server_task, "udp_8006", 4096, (void*)8006, 5, NULL);
-    xTaskCreate(udp_server_task, "udp_8007", 4096, (void*)8007, 5, NULL);
+    // F. Periyodik Okuma İstek Motoru (Scheduler)
+    xTaskCreate(meter_scheduler_task, "meter_sched", 8192, NULL, 7, NULL);
 
-    // 9. Meter-Read Protokolü için UDP 8008 Task'ı (YENİ)
-    xTaskCreate(udp_meter_task, "udp_meter", 8192, (void*)8008, 10, NULL);
+    // =========================================================
 
-    // 10. Meter Scheduler Task (Periyodik okuma başlatma) (YENİ)
-    xTaskCreate(meter_scheduler_task, "meter_sched", 4096, NULL, 7, NULL);
-    // ========== YENİ BÖLÜM SONU ==========
-
-    // Ana döngü
+    // Ana Döngü
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000)); 
     }
