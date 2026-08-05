@@ -23,7 +23,9 @@
 #define MR_DATA             0x04
 #define MR_MISS             0x05
 #define MR_READ_ERROR       0x06
-
+#define MR_OBIS_REQUEST                 0x10
+#define MR_OBIS_RESPONSE                0x11
+#define PERIODIC_OBIS_CODE_CHECK_REQUEST 0x20
 // ==========================================
 // MR_READ_REQUEST Flags Bitmask Yapısı
 // ==========================================
@@ -88,13 +90,18 @@ typedef struct {
 // ==========================================
 
 
+// meter_protocol.h dosyasının içinde, prototiplerin olduğu kısma ekle:
 
+void obis_process_incoming_packet(const char* node_serial, const char* meter_serial, 
+                                  uint16_t seq, uint8_t frame_count, uint8_t frame_id, 
+                                  uint8_t obis_count, const uint8_t* data, uint16_t data_len);
 
 // Doğru imza: Uzunluk kesinlikle unsigned (size_t) olmalı.
 void handle_meter_read(int sock, const uint8_t *payload, size_t len, struct sockaddr_in6 *src_addr);
 
 void check_all_collect_data(void);
 void process_completed_data(collect_data_t *cd);
+bool is_meter_read_in_progress_by_addr(const struct sockaddr_in6 *src_addr);
 
 // Yardımcı Dönüşüm Fonksiyonları
 uint8_t convert_baud_to_byte(int baud);

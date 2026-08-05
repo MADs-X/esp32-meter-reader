@@ -1,8 +1,16 @@
 dependencies:
+  esp_wireguard:
+    component_hash: d3845c88b511f24b1175ac0e0b5577b245c556b40c4fe784a91c432487377729
+    dependencies: []
+    source:
+      git: https://github.com/martin-ger/esp_wireguard_idf_5.5.x.git
+      path: .
+      type: git
+    version: 02a24fad29365db09e0088df2f8c4414632fe35a
   idf:
     source:
       type: idf
-    version: 6.0.2
+    version: 5.5.4
   joltwallet/littlefs:
     component_hash: 362f1f5beb5087b0c60169aff82676d2d0ffc991ead975212b0cba95959181c5
     dependencies:
@@ -22,9 +30,10 @@ dependencies:
       type: git
     version: bf5a8617a9c1933b525f9484ed7e328a1d8bd02f
 direct_dependencies:
+- esp_wireguard
 - idf
 - joltwallet/littlefs
 - sqlite3
-manifest_hash: 1d052fae75db7d1da777022bb4c4473d7e26a4ffc72d06f394e3be7255792215
+manifest_hash: df065628927faefc9bf23c6caffa686fbdee7b67d53df032263b5bec9ff996a2
 target: esp32s3
-version: 3.0.0
+version: 2.0.0

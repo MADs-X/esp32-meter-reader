@@ -15,5 +15,5 @@ void handle_meter_read(int sock, const uint8_t *payload, size_t len, struct sock
 
 // Başlatma fonksiyonu
 void init_udp_handlers(void);
-
+int get_udp_socket_for_port(uint16_t port);
 #endif

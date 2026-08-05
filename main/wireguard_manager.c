@@ -30,16 +30,6 @@ esp_err_t wireguard_manager_start(void) {
     config.allowed_ip      = CONFIG_WIREGUARD_LOCAL_IP;   // "10.8.161.1"
     config.allowed_ip_mask = "255.255.255.255";           // /32
 
-    // ★ HANGİ TRAFİĞİ TÜNELLEYECEĞİMİZ?
-    // Bu kütüphanede ayrı bir "allowed_ips" alanı yok.
-    // Eğer tüm trafiği tünellemek istiyorsanız, aşağıdaki satırı ekleyin:
-    // (ancak bu durumda Wi-Fi üzerinden internete çıkamazsınız)
-    // config.allowed_ip = "0.0.0.0";
-    // config.allowed_ip_mask = "0.0.0.0";
-    //
-    // Sadece 10.8.0.251'e gitmek istiyorsanız, yukarıdaki yerel IP ayarını koruyun
-    // ve default route'u WireGuard'a ayarlayın (aşağıda yapılıyor).
-
     config.netif_key   = "WIFI_STA_DEF";
     config.persistent_keepalive = 25;
 
@@ -111,4 +101,25 @@ void wireguard_manager_stop(void) {
 
 bool wireguard_manager_is_connected(void) {
     return s_wg_connected;
+}
+static const char *TAG_MONITOR = "WG_MONITOR";
+
+void wireguard_manager_monitor_task(void *pvParameters) {
+    ESP_LOGI(TAG_MONITOR, "WireGuard monitor task started.");
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(30000)); // 30 saniye bekle
+
+        bool connected = wireguard_manager_is_connected();
+        if (!connected) {
+            ESP_LOGW(TAG_MONITOR, "WireGuard bağlantısı kopmuş! Yeniden bağlanılıyor...");
+            wireguard_manager_stop();
+            vTaskDelay(pdMS_TO_TICKS(2000)); // 2 saniye bekle, soketlerin kapanmasını sağla
+            esp_err_t err = wireguard_manager_start();
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG_MONITOR, "WireGuard yeniden bağlandı.");
+            } else {
+                ESP_LOGE(TAG_MONITOR, "WireGuard yeniden bağlanamadı! (err: %s)", esp_err_to_name(err));
+            }
+        }
+    }
 }

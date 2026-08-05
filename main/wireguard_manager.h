@@ -29,7 +29,7 @@ void wireguard_manager_stop(void);
  * @return true if connected and routeable, false otherwise.
  */
 bool wireguard_manager_is_connected(void);
-
+void wireguard_manager_monitor_task(void *pvParameters);
 #ifdef __cplusplus
 }
 #endif
